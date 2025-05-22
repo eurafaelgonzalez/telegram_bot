@@ -1,0 +1,449 @@
+import sqlite3
+import os
+import platform
+import logging
+import asyncio
+import time
+import requests
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    filters,
+    ContextTypes,
+    ConversationHandler,
+    CallbackQueryHandler,
+)
+from dotenv import load_dotenv
+
+# Configurar logging pra ver tudinho
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# Carregar variáveis do .env
+load_dotenv()
+
+# Configuraçõezinhas
+PIX_KEY = os.getenv("PIX_KEY")  # Chave PIX (opcional, mantida pra compatibilidade)
+ADMIN_ID = int(os.getenv("ADMIN_ID"))
+PHOTO_PRICE = 25.00
+PAGSEGURO_EMAIL = "teste@pagseguro.com.br"
+PAGSEGURO_TOKEN = "6F34E887A0A440E6944776FD7688ACFF"
+PAGSEGURO_API_URL = "https://sandbox.api.pagseguro.com/orders"
+
+# Estados da conversa
+PHOTO, CHOOSE_OPTION = range(2)
+
+# Inicializar banco de dados
+def init_db():
+    conn = sqlite3.connect("users.db")
+    c = conn.cursor()
+    c.execute(
+        """CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            name TEXT,
+            cnh TEXT,
+            category TEXT,
+            expiration TEXT,
+            facial_photo TEXT,
+            balance REAL DEFAULT 0.0,
+            selected_option TEXT,
+            payment_timestamp REAL,
+            order_id TEXT
+        )"""
+    )
+    c.execute(
+        """CREATE TABLE IF NOT EXISTS photos (
+            photo_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            photo_path TEXT,
+            description TEXT,
+            price REAL,
+            percentage TEXT,
+            text_path TEXT
+        )"""
+    )
+    conn.commit()
+    conn.close()
+
+# Função pra salvar usuário
+def save_user(user_id, name="Desconhecido", cnh="Não informado", category="Não informado", expiration="Não informado"):
+    conn = sqlite3.connect("users.db")
+    c = conn.cursor()
+    c.execute(
+        "INSERT OR REPLACE INTO users (user_id, name, cnh, category, expiration) VALUES (?, ?, ?, ?, ?)",
+        (user_id, name, cnh, category, expiration),
+    )
+    conn.commit()
+    conn.close()
+
+# Função pra atualizar saldo
+def update_balance(user_id, amount):
+    conn = sqlite3.connect("users.db")
+    c = conn.cursor()
+    c.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (amount, user_id))
+    conn.commit()
+    conn.close()
+
+# Função pra salvar foto facial
+def save_facial_photo(user_id, photo_path):
+    conn = sqlite3.connect("users.db")
+    c = conn.cursor()
+    c.execute("UPDATE users SET facial_photo = ? WHERE user_id = ?", (photo_path, user_id))
+    conn.commit()
+    conn.close()
+
+# Função pra salvar opção escolhida
+def save_selected_option(user_id, option):
+    conn = sqlite3.connect("users.db")
+    c = conn.cursor()
+    c.execute("UPDATE users SET selected_option = ? WHERE user_id = ?", (option, user_id))
+    conn.commit()
+    conn.close()
+
+# Função pra salvar timestamp do pagamento
+def save_payment_timestamp(user_id):
+    conn = sqlite3.connect("users.db")
+    c = conn.cursor()
+    c.execute("UPDATE users SET payment_timestamp = ? WHERE user_id = ?", (time.time(), user_id))
+    conn.commit()
+    conn.close()
+
+# Função pra salvar ID do pedido
+def save_order_id(user_id, order_id):
+    conn = sqlite3.connect("users.db")
+    c = conn.cursor()
+    c.execute("UPDATE users SET order_id = ? WHERE user_id = ?", (order_id, user_id))
+    conn.commit()
+    conn.close()
+
+# Função pra limpar dados de pagamento
+def clear_payment_data(user_id):
+    conn = sqlite3.connect("users.db")
+    c = conn.cursor()
+    c.execute("UPDATE users SET payment_timestamp = NULL, selected_option = NULL, order_id = NULL WHERE user_id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+
+# Função pra verificar status do pagamento
+def check_payment_status(user_id):
+    conn = sqlite3.connect("users.db")
+    c = conn.cursor()
+    c.execute("SELECT order_id, payment_timestamp FROM users WHERE user_id = ?", (user_id,))
+    result = c.fetchone()
+    conn.close()
+    if not result:
+        return False, "Usuário não encontrado."
+    order_id, timestamp = result
+    if not order_id or not timestamp:
+        return False, "Nenhum pedido encontrado."
+    if time.time() - timestamp > 300:  # 5 minutos
+        return False, "Tempo de confirmação expirado."
+    
+    # Consultar status na API do PagSeguro
+    try:
+        headers = {
+            "Authorization": f"Bearer {PAGSEGURO_TOKEN}",
+            "Content-Type": "application/json",
+            "x-api-version": "4.0",
+            "x-sandbox-token": PAGSEGURO_TOKEN
+        }
+        response = requests.get(f"{PAGSEGURO_API_URL}/{order_id}", headers=headers)
+        response.raise_for_status()
+        data = response.json()
+        status = data.get("charges", [{}])[0].get("status")
+        if status == "PAID":
+            return True, "Pagamento confirmado!"
+        return False, f"Pagamento ainda não confirmado. Status: {status}"
+    except Exception as e:
+        logger.error(f"Erro ao consultar pagamento para o usuário {user_id}: {e}")
+        return False, f"Erro ao verificar pagamento: {str(e)}"
+
+# Função pra salvar arquivo TXT
+def save_text_file(photo_name, content):
+    text_path = f"texts/{photo_name}.txt"
+    os.makedirs("texts", exist_ok=True)
+    with open(text_path, "w", encoding="utf-8") as f:
+        f.write(content)
+    return text_path
+
+# Comando /start
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user_id = update.effective_user.id
+    logger.info(f"Usuário {user_id} começou com /start")
+    if user_id == ADMIN_ID:
+        logger.info(f"Usuário {user_id} é o adminzão!")
+    try:
+        save_user(user_id)
+        logger.info(f"Usuário {user_id} salvo no banco")
+        await update.message.reply_text("Oi, fofura! Envie uma foto facial pra continuar, tá? 😊")
+        logger.info(f"Mensagem de boas-vindas enviada pro usuário {user_id}")
+    except Exception as e:
+        logger.error(f"Eita, erro no /start pro usuário {user_id}: {e}")
+        await update.message.reply_text("Ops, algo deu errado! Tenta de novo ou usa /ajuda.")
+        raise
+    return PHOTO
+
+# Comando /inicio
+async def inicio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user_id = update.effective_user.id
+    logger.info(f"Usuário {user_id} usou /inicio")
+    try:
+        conn = sqlite3.connect("users.db")
+        c = conn.cursor()
+        c.execute("SELECT name, cnh, category, expiration, facial_photo FROM users WHERE user_id = ?", (user_id,))
+        result = c.fetchone()
+        conn.close()
+        if result:
+            name, cnh, category, expiration, facial_photo = result
+            response = f"Perfil:\nNome: {name}\nCNH: {cnh}\nCategoria: {category}\nVencimento: {expiration}"
+            await update.message.reply_text(response)
+            if facial_photo:
+                await update.message.reply_photo(open(facial_photo, "rb"), caption="Sua foto facial")
+        else:
+            await update.message.reply_text("Nenhum perfil encontrado. Usa /start pra configurar!")
+        clear_payment_data(user_id)
+        await update.message.reply_text("Tudo zerado! Envie uma foto facial pra começar de novo.")
+        logger.info(f"Processo reiniciado pro usuário {user_id}")
+    except Exception as e:
+        logger.error(f"Erro no /inicio pro usuário {user_id}: {e}")
+        await update.message.reply_text("Ops, algo deu errado! Tenta de novo ou usa /ajuda.")
+        raise
+    return PHOTO
+
+# Receber a foto facial
+async def receive_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user_id = update.effective_user.id
+    logger.info(f"Usuário {user_id} enviou uma foto facial")
+    photo_file = await update.message.photo[-1].get_file()
+    photo_path = f"photos/{user_id}.jpg"
+    os.makedirs("photos", exist_ok=True)
+    await photo_file.download_to_drive(photo_path)
+    save_facial_photo(user_id, photo_path)
+
+    # Enviar foto1.jpg
+    with open("foto1.jpg", "rb") as photo1:
+        keyboard = [
+            [InlineKeyboardButton("FOTO1: 35% - R$25,00", callback_data="FOTO1")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_photo(
+            photo=photo1,
+            caption="FOTO1: 35% - R$25,00",
+            reply_markup=reply_markup
+        )
+
+    # Enviar foto2.jpg
+    with open("foto2.jpg", "rb") as photo2:
+        keyboard = [
+            [InlineKeyboardButton("FOTO2: 49% - R$25,00", callback_data="FOTO2")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_photo(
+            photo=photo2,
+            caption="FOTO2: 49% - R$25,00",
+            reply_markup=reply_markup
+        )
+
+    return CHOOSE_OPTION
+
+# Escolher a opção e criar cobrança PIX
+async def choose_option(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    option = query.data
+    logger.info(f"Usuário {user_id} escolheu {option}")
+    save_selected_option(user_id, option)
+    save_payment_timestamp(user_id)
+
+    # Criar cobrança PIX na API do PagSeguro
+    try:
+        headers = {
+            "Authorization": f"Bearer {PAGSEGURO_TOKEN}",
+            "Content-Type": "application/json",
+            "x-api-version": "4.0",
+            "x-sandbox-token": PAGSEGURO_TOKEN
+        }
+        payload = {
+            "reference_id": f"order_{user_id}_{int(time.time())}",
+            "customer": {
+                "name": "Teste",
+                "email": PAGSEGURO_EMAIL,
+                "tax_id": "12345678909"
+            },
+            "items": [
+                {
+                    "name": f"Foto {option}",
+                    "quantity": 1,
+                    "unit_amount": int(PHOTO_PRICE * 100)  # Em centavos
+                }
+            ],
+            "qr_codes": [
+                {
+                    "amount": {
+                        "value": int(PHOTO_PRICE * 100)
+                    },
+                    "expiration_date": (time.strftime("%Y-%m-%dT%H:%M:%S-03:00", time.localtime(time.time() + 300)))
+                }
+            ]
+        }
+        response = requests.post(PAGSEGURO_API_URL, json=payload, headers=headers)
+        response.raise_for_status()
+        data = response.json()
+        order_id = data.get("id")
+        qr_code = data.get("qr_codes", [{}])[0].get("links", [{}])[0].get("href")
+        qr_code_text = data.get("qr_codes", [{}])[0].get("text")
+        
+        save_order_id(user_id, order_id)
+        logger.info(f"Cobrança PIX criada para usuário {user_id}, order_id: {order_id}")
+
+        # Enviar QR code pro usuário
+        await query.message.reply_photo(
+            photo=qr_code,
+            caption=f"Você escolheu {option}! Pague R${PHOTO_PRICE:.2f} via PIX escaneando este QR code.\n\nChave PIX (copia e cola):\n{qr_code_text}"
+        )
+        await query.message.reply_text(
+            "Aguarde a confirmação do pagamento (até 5 minutos). Quando confirmado, você recebe a foto! 😊"
+        )
+
+        # Iniciar verificação do pagamento
+        context.job_queue.run_repeating(
+            check_payment_job,
+            interval=10,
+            first=10,
+            data={"user_id": user_id, "option": option},
+            chat_id=update.effective_chat.id,
+            user_id=user_id
+        )
+    except Exception as e:
+        logger.error(f"Erro ao criar cobrança PIX para usuário {user_id}: {e}")
+        await query.message.reply_text(f"Ops, erro ao gerar o PIX: {str(e)}. Tenta de novo ou usa /ajuda.")
+        clear_payment_data(user_id)
+        return ConversationHandler.END
+
+    return ConversationHandler.END
+
+# Job pra verificar pagamento
+async def check_payment_job(context: ContextTypes.DEFAULT_TYPE):
+    job = context.job
+    user_id = job.data["user_id"]
+    option = job.data["option"]
+    
+    status, message = check_payment_status(user_id)
+    if status:
+        update_balance(user_id, PHOTO_PRICE)
+        photo_name = "123456789" if option == "FOTO1" else "987654321"
+        photo_path = f"{photo_name}.jpg"
+        text_content = f"Informações para {photo_name}.jpg:\n- Descrição: Foto de teste\n- Preço: R${PHOTO_PRICE:.2f}"
+        text_path = save_text_file(photo_name, text_content)
+        
+        await context.bot.send_photo(
+            chat_id=job.chat_id,
+            photo=open(photo_path, "rb"),
+            caption=f"Pagamento confirmado! Aqui tá a {option}! 😊"
+        )
+        await context.bot.send_document(
+            chat_id=job.chat_id,
+            document=open(text_path, "rb"),
+            filename=f"{photo_name}.txt"
+        )
+        clear_payment_data(user_id)
+        job.schedule_removal()  # Para o job
+    elif "expirado" in message.lower() or "erro" in message.lower():
+        await context.bot.send_message(
+            chat_id=job.chat_id,
+            text=f"Ops, {message} Tenta de novo com /start."
+        )
+        clear_payment_data(user_id)
+        job.schedule_removal()
+
+# Comando /saldo
+async def saldo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    conn = sqlite3.connect("users.db")
+    c = conn.cursor()
+    c.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,))
+    result = c.fetchone()
+    conn.close()
+    balance = result[0] if result else 0.0
+    await update.message.reply_text(f"Seu saldo é: R${balance:.2f}")
+
+# Comando /pix
+async def pix(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Use /start pra gerar um PIX dinâmico pra pagamento!")
+
+# Comando /perfil
+async def perfil(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    conn = sqlite3.connect("users.db")
+    c = conn.cursor()
+    c.execute("SELECT name, cnh, category, expiration, facial_photo FROM users WHERE user_id = ?", (user_id,))
+    result = c.fetchone()
+    conn.close()
+    if result:
+        name, cnh, category, expiration, facial_photo = result
+        await update.message.reply_text(
+            f"Perfil:\nNome: {name}\nCNH: {cnh}\nCategoria: {category}\nVencimento: {expiration}"
+        )
+        if facial_photo:
+            await update.message.reply_photo(open(facial_photo, "rb"), caption="Sua foto facial")
+    else:
+        await update.message.reply_text("Nenhum perfil encontrado. Usa /start pra configurar!")
+
+# Comando /ajuda
+async def ajuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "/start - Começa o bot e pede uma foto facial\n"
+        "/inicio - Mostra seu perfil e reinicia tudo\n"
+        "/saldo - Mostra seu saldo atual\n"
+        "/pix - Informa como pagar via PIX\n"
+        "/perfil - Mostra suas infos de perfil\n"
+        "/ajuda - Mostra este menu fofinho"
+    )
+
+# Lidar com erros
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.error(f"Erro: {context.error}")
+    if update and update.message:
+        await update.message.reply_text("Ops, algo deu errado! Tenta de novo ou usa /ajuda.")
+
+def main():
+    init_db()
+    logger.info("Bot iniciado e prontinho pra conversar no Telegram...")
+    try:
+        application = Application.builder().token(os.getenv("BOT_TOKEN")).build()
+        logger.info("Conexão com o Telegram tá de boa!")
+    except Exception as e:
+        logger.error(f"Eita, erro ao iniciar o bot: {e}")
+        raise
+
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("start", start)],
+        states={
+            PHOTO: [MessageHandler(filters.PHOTO, receive_photo)],
+            CHOOSE_OPTION: [CallbackQueryHandler(choose_option)],
+        },
+        fallbacks=[],
+    )
+
+    application.add_handler(conv_handler)
+    application.add_handler(CommandHandler("inicio", inicio))
+    application.add_handler(CommandHandler("saldo", saldo))
+    application.add_handler(CommandHandler("pix", pix))
+    application.add_handler(CommandHandler("perfil", perfil))
+    application.add_handler(CommandHandler("ajuda", ajuda))
+    application.add_error_handler(error_handler)
+
+    logger.info("Iniciando o polling...")
+    application.run_polling()
+    logger.info("Polling funcionando direitinho!")
+
+if platform.system() == "Emscripten":
+    asyncio.ensure_future(main())
+else:
+    if __name__ == "__main__":
+        asyncio.run(main())
